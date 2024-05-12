@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-import gymnasium as gym
+import gym
 from typing import Any, NamedTuple
 
 class Agent(ABC):
@@ -60,34 +60,33 @@ class Turn(NamedTuple):
     action: Any
     reward: Any
 
-@dataclass
-class Episode:
-    observations: list = field(default_factory=list)
-    next_observations: list = field(default_factory=list)
-    actions: list = field(default_factory=list)
-    rewards: list = field(default_factory=list)
-
 class EpisodeBuffer:
-    def __init__(self):
+    def __init__(self, maxlen, obs_shape, act_shape):
+        self.observations = torch.zeros((maxlen,) + obs_shape)
+        self.next_observations = torch.zeros((maxlen, ) + obs_shape)
+        self.rewards = torch.zeros(maxlen)
+        self.actions = torch.zeros((maxlen, ) + act_shape)
+        self.last = 0
         self.episodes = []
-        pass
+        
 
-    def collect_one(self, env: gym.Env, agent: Agent, time_limit: int):
+    def collect_one(self, env: gym.Env, agent: Agent, device, time_limit: int):
         observation, info = env.reset()
-        episode = Episode()
+        start = self.last
 
         for i in range(time_limit):
-            cur_obs = agent.encode(observation)
-            action = agent.get_action(torch.as_tensor(cur_obs, dtype=torch.float32))
+            cur_obs = np.array(agent.encode(observation))
+            action = agent.get_action(torch.from_numpy(cur_obs).to(device))
             observation, reward, terminated, truncated, info = env.step(action)
-            episode.observations.append(cur_obs)
-            episode.next_observations.append(agent.encode(observation))
-            episode.actions.append(action)
-            episode.rewards.append(reward)
-            if terminated or truncated:
+            obs = np.array(agent.encode(observation))
+            self.observations[self.last] = torch.from_numpy(cur_obs)
+            self.next_observations[self.last] = torch.from_numpy(obs)
+            self.actions[self.last] = action
+            self.rewards[self.last] = reward
+            self.last += 1
+            if terminated:
                 break
-
-        self.episodes.append(episode)
+        self.episodes.append((start, self.last))
 
     def get_episodes(self):
         return self.episodes
@@ -101,86 +100,103 @@ class PPOOptions:
     optimizer: torch.optim.Optimizer
     gamma: float = 0.99
     epsilon: float = 0.1
-    batch_size: int = 64
+    batch_nums: int = 4
     max_episode_len: int = 1024
     epochs: int = 1000
     entropy: float = 0.01
     num_envs: int = 4
-    report_loss: Any = None
+    train_count: int = 1
+    report_train: Any = None
     report_reward: Any = None
+    create_env: Any = None
+    batch_size: Any = None
 
-def ppo_train(envname, agent: A2CAgent, options: PPOOptions):
-    env = gym.make(envname)
+def ppo_train(create_env, agent: A2CAgent, device, options: PPOOptions):
+    env = create_env()
     stats = RLTrainStats()
 
     for i in range(options.epochs):
-        episode_buffer = EpisodeBuffer()
+        episode_buffer = EpisodeBuffer(options.num_envs * options.max_episode_len, env.observation_space.shape, (1,),)
+        sz = 0
         for k in range(options.num_envs):
-            episode_buffer.collect_one(env, agent, options.max_episode_len)
+            episode_buffer.collect_one(env, agent, device, options.max_episode_len)
 
-        batch_obs = []
-        batch_next_obs = []
-        batch_rewards = []
-        batch_rewards_to_go = []
-        batch_acts = []
 
-        for episode in episode_buffer.get_episodes():
-            batch_obs.extend(episode.observations)
-            batch_next_obs.extend(episode.next_observations)
-            batch_rewards.extend(episode.rewards)
-            rewards_to_go = episode.rewards.copy()
-            n = len(episode.observations)
-            for i in reversed(range(n-1)):
-                rewards_to_go[i] += options.gamma*rewards_to_go[i+1]
-            batch_rewards_to_go.extend(rewards_to_go)
-            batch_acts.extend(episode.actions)
-
+        m = episode_buffer.last
+        batch_rewards_to_go = torch.zeros(m)
+        for (s,e) in episode_buffer.episodes:
+            for i in reversed(range(s, e-1)):
+                batch_rewards_to_go[i] += episode_buffer.rewards[i] + options.gamma*batch_rewards_to_go[i+1]
             if options.report_reward:
-                options.report_reward(np.sum(episode.rewards))
-            stats.reward_history.append(np.sum(episode.rewards))
+                options.report_reward(torch.sum(episode_buffer.rewards[s:e]))
 
-        m = len(batch_obs)
-        perm = np.random.permutation(m)
-        batch_obs = torch.as_tensor(batch_obs, dtype=torch.float32)[perm]
-        batch_next_obs = torch.as_tensor(batch_next_obs, dtype=torch.float32)[perm]
-        batch_rewards = torch.as_tensor(batch_rewards, dtype=torch.float32)[perm][:, None]
-        batch_rewards_to_go = torch.as_tensor(batch_rewards_to_go, dtype=torch.float32)[perm][:, None]
-        batch_acts = torch.as_tensor(batch_acts, dtype=torch.float32)[perm]
+        batch_obs = episode_buffer.observations.to(device)[:episode_buffer.last]
+        batch_next_obs = episode_buffer.next_observations.to(device)[:episode_buffer.last]
+        batch_rewards = episode_buffer.rewards.to(device)[:episode_buffer.last]
+        batch_rewards_to_go = batch_rewards_to_go.to(device)[:episode_buffer.last]
+        batch_acts = episode_buffer.actions.to(device)[:episode_buffer.last]
 
-        A = (batch_rewards_to_go - agent.get_value(batch_obs)).detach()
-        logp_old = agent.get_policy(batch_obs).log_prob(batch_acts).detach()[:, None]
-        for j in range((m+options.batch_size-1)//options.batch_size):
-            start = j*options.batch_size
-            end = min((j+1)*options.batch_size,m)
 
-            options.optimizer.zero_grad()
-            y = options.gamma*agent.get_value(batch_next_obs[start:end]) + batch_rewards[start:end]
+        A = (batch_rewards_to_go - agent.get_value(batch_obs).reshape(-1)).detach()
+        logp_old = agent.get_policy(batch_obs).log_prob(batch_acts.reshape(-1)).detach()
+        if options.batch_size:
+            batch_size = options.batch_size
+        else:
+            batch_size = (m + options.batch_nums - 1) // options.batch_nums
+        for _ in range(options.train_count):
+            perm = np.random.permutation(m)
+            batch_obs = batch_obs[perm]
+            batch_next_obs = batch_next_obs[perm]
+            batch_rewards = batch_rewards[perm]
+            batch_rewards_to_go = batch_rewards_to_go[perm]
+            batch_acts = batch_acts[perm]
+            A = A[perm]
+            logp_old = logp_old[perm]
+            for j in range((m+batch_size-1)//batch_size):
+                start = j*batch_size
+                end = min((j+1)*batch_size,m)
 
-            logp = agent.get_policy(batch_obs[start:end]).log_prob(batch_acts[start:end])[:, None]
+                options.optimizer.zero_grad()
+                y = options.gamma*agent.get_value(batch_next_obs[start:end]).reshape(-1) + batch_rewards[start:end]
 
-            ratios = (logp - logp_old[start:end]).exp()
-            surr1 = ratios * A[start:end]
-            surr2 = torch.clamp(ratios, 1-options.epsilon, 1+options.epsilon) * A[start:end]
+                logp = agent.get_policy(batch_obs[start:end]).log_prob(batch_acts[start:end].reshape(-1))
 
-            loss1 = F.mse_loss(y, batch_rewards_to_go[start:end])
-            loss2 = -torch.min(surr1,surr2).mean()
+                log_ratio = (logp - logp_old[start:end])
+                ratios = log_ratio.exp()
 
-            probs = agent.get_policy(batch_obs[start:end]).probs
-            ent = -(probs * torch.log(probs)).sum()
+                with torch.no_grad():
+                    approx_kl = ((ratios - 1) - log_ratio).mean()
 
-            total_loss = (0.5*loss1 + loss2 - options.entropy * ent) / ((m+options.batch_size-1)//options.batch_size)
-            total_loss.backward()
-            options.optimizer.step()
+                surr1 = ratios * A[start:end]
+                surr2 = torch.clamp(ratios, 1-options.epsilon, 1+options.epsilon) * A[start:end]
 
-            if options.report_loss:
-                options.report_loss(total_loss.item())
-            stats.loss_history.append(total_loss.item())
+                loss1 = F.mse_loss(y, batch_rewards_to_go[start:end])
+                loss2 = -torch.min(surr1,surr2).mean()
+
+                entropy = agent.get_policy(batch_obs[start:end]).entropy()
+                ent = entropy.mean()
+
+                total_loss = (0.5*loss1 + loss2 - options.entropy * ent) / options.batch_nums
+                total_loss.backward()
+                options.optimizer.step()
+
+
+                if options.report_train:
+                    options.report_train({
+                        'total_loss': total_loss.item(),
+                        'value_loss': loss1.item(),
+                        'policy_loss': loss2.item(),
+                        'entropy': ent.item(),
+                        'ratios': ratios.mean().item(),
+                        'approx_kl': approx_kl.item()
+                    })
+                stats.loss_history.append(total_loss.item())
     return stats
 
 
 def test():
     N = 48
-    env = gym.make('Taxi-v3')
+    env = create_env()
     class NeuralNetwork(nn.Module):
         def __init__(self, obs_size, act_size):
             super().__init__()
@@ -213,34 +229,35 @@ def test():
     ppo_train('Taxi-v3', agent, options)
     run_jupyter('Taxi-v3', agent)
 
-def run(envname, agent, max_episode_len=int(1e5)):
-    env = gym.make(envname, render_mode="human")
+def run(create_env, agent, device, max_episode_len=int(1e5)):
+    env = create_env()
     while True:
         observation, info = env.reset()
         env.render()
 
         for j in range(max_episode_len):
-            action = agent.get_action(torch.as_tensor(agent.encode(observation), dtype=torch.float32))
+            action = agent.get_action(torch.as_tensor(agent.encode(observation), dtype=torch.float32).to(device))
             observation, reward, terminated, truncated, info = env.step(action)
             env.render()
-            if terminated or truncated:
+            if terminated:
                 break
 
-def run_jupyter(envname, agent, max_episode_len=int(1e5)):
+def run_jupyter(create_env, agent, device, max_episode_len=int(1e5)):
     from IPython.display import clear_output
     import matplotlib.pyplot as plt
-    env = gym.make(envname, render_mode="rgb_array")
+    env = create_env('rgb_array')
 
     while True:
         observation, info = env.reset()
-        env.render()
 
         for j in range(max_episode_len):
-            action = agent.get_action(torch.as_tensor(agent.encode(observation), dtype=torch.float32))
+            xx = torch.as_tensor(agent.encode(observation), dtype=torch.float32).to(device)
+            print(agent.get_policy(xx).probs)
+            action = agent.get_action(xx)
             observation, reward, terminated, truncated, info = env.step(action)
             clear_output(wait=True)
             plt.imshow(env.render())
             plt.show()
-            if terminated or truncated:
+            if terminated:
                 break
 
