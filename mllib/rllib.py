@@ -1,6 +1,7 @@
 import torch
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
+import math
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,9 +12,10 @@ class OneHotObservationWrapper(gym.ObservationWrapper):
     def __init__(self, env: gym.Env):
         super().__init__(env)
         self.obs_size = env.observation_space.n
+        env.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.obs_size,),)
 
     def observation(self, observation):
-        return np.eye(self.obs_size)[observation]
+        return np.eye(self.obs_size)[observation].astype(np.float32)
 
 class TorchObservationWrapper(gym.ObservationWrapper):
     def __init__(self, env: gym.Env):
@@ -36,43 +38,104 @@ class RLTrainStats:
     reward_history: list = field(default_factory=list)
     length_history: list = field(default_factory=list)
 
-class EpisodeBuffer:
+class EpisodeBuffer(ABC):
     def __init__(self, maxlen, obs_shape, act_shape):
         self.observations = torch.zeros((maxlen,) + obs_shape)
         self.next_observations = torch.zeros((maxlen, ) + obs_shape)
         self.rewards = torch.zeros(maxlen)
-        self.actions = torch.zeros((maxlen, ) + act_shape)
-        self.size = 0
-        self.episodes = []
+        self.actions = torch.zeros((maxlen, ) + act_shape, dtype=torch.long)
+        self.dones = torch.zeros((maxlen, 1))
+        self.maxlen = maxlen
+
+    @abstractmethod
+    def add_record(self, cur_obs, observation, action, reward, done):
+        pass
+
+    @abstractmethod
+    def stop_episode(self):
+        pass
+
+    @abstractmethod
+    def start_episode(self):
+        pass
 
     def collect_one(self, env: gym.Env, agent: Agent, time_limit: int):
         observation, info = env.reset()
-        start = self.size
 
+        self.start_episode()
+        tot_reward = 0.0
         for i in range(time_limit):
             cur_obs = observation
             action = agent.get_action(cur_obs)
             observation, reward, terminated, truncated, info = env.step(action)
-            self.observations[self.size] = cur_obs
-            self.next_observations[self.size] = observation
-            self.actions[self.size] = action
-            self.rewards[self.size] = reward
-            self.size += 1
+            self.add_record(cur_obs, observation, action, reward, terminated)
+            tot_reward += reward
             if terminated:
                 break
-        self.episodes.append((start, self.size))
+        self.stop_episode()
+        return tot_reward
+
+class RolloutEpisodeBuffer(EpisodeBuffer):
+    def __init__(self, maxlen, obs_shape, act_shape):
+        super().__init__(maxlen, obs_shape, act_shape)
+        self.episodes = []
+        self.size = 0
+
+    def add_record(self, cur_obs, observation, action, reward, done):
+        self.observations[self.size] = cur_obs
+        self.next_observations[self.size] = observation
+        self.actions[self.size] = action
+        self.rewards[self.size] = reward
+        self.dones[self.size] = done
+        self.size += 1
+
+    def start_episode(self):
+        self.start = self.size
+
+    def stop_episode(self):
+        self.episodes.append((self.start, self.size))
 
     def cut(self):
         self.observations = self.observations[:self.size]
         self.next_observations = self.next_observations[:self.size]
         self.rewards = self.rewards[:self.size]
         self.actions = self.actions[:self.size]
+        self.dones = self.dones[:self.size]
 
     def get_episodes(self):
         return self.episodes
 
+class ReplayEpisodeBuffer(EpisodeBuffer):
+    def __init__(self, maxlen, obs_shape, act_shape):
+        super().__init__(maxlen, obs_shape, act_shape)
+        self.cursor = 0
+        self.size = 0
+
+    def add_record(self, cur_obs, observation, action, reward, done):
+        self.observations[self.cursor] = cur_obs
+        self.next_observations[self.cursor] = observation
+        self.actions[self.cursor] = action
+        self.rewards[self.cursor] = reward
+        self.dones[self.cursor] = done 
+        self.cursor += 1
+        self.cursor %= self.maxlen
+        self.size += 1
+        self.size = min(self.size, self.maxlen)
+
+    def start_episode(self):
+        pass
+
+    def stop_episode(self):
+        pass
+
+    def sample(self, n):
+        if self.size <= n:
+            return (self.observations, self.next_observations, self.actions, self.rewards, self.dones)
+        else:
+            perm = np.random.choice(range(self.size), n, replace=False)
+            return (self.observations[perm], self.next_observations[perm], self.actions[perm], self.rewards[perm], self.dones[perm])
 #
-# Value fitting agent for tabular case
+# Value iteration agent for tabular case
 #
 # we only try to approximate A(s,a) value in policy graident and set policy as
 # pi(a|s) = 1 if a = argmax_a A(s,a)
@@ -90,12 +153,12 @@ class EpisodeBuffer:
 # - requires full table which can be huge on memory and need to know state transition beforehand
 #
 @dataclass
-class ValueFittingOptions:
+class ValueIterationOptions:
     gamma: float = 0.99
     max_episode_len: int = 1024
     epochs: int = 1000
 
-class ValueFittingAgent(Agent):
+class ValueIterationAgent(Agent):
     def __init__(self, state_size, action_size):
         inf = 1e9
         self.Q = np.random.rand(state_size, action_size)
@@ -105,14 +168,14 @@ class ValueFittingAgent(Agent):
         return np.argmax(self.Q, axis=1)[observation]
 
 # Assumes determinstic state transition
-def value_fitting_train(create_env, agent: ValueFittingAgent, options: ValueFittingOptions):
+def value_iteration_train(create_env, agent: ValueIterationAgent, options: ValueIterationOptions):
     env = create_env()
     stats = RLTrainStats()
     state_size = env.observation_space.n
     action_size = env.action_space.n
     transition = [[(-1,-1) for i in range(action_size)] for j in range(state_size)]
     for i in range(options.epochs):
-        eb = EpisodeBuffer(options.max_episode_len, (1, ), (1,))
+        eb = RolloutEpisodeBuffer(options.max_episode_len, (1, ), (1,))
         eb.collect_one(env, agent, options.max_episode_len)
 
         tot_reward = torch.sum(eb.rewards).item()
@@ -138,7 +201,106 @@ def value_fitting_train(create_env, agent: ValueFittingAgent, options: ValueFitt
         agent.V = np.max(agent.Q, axis=1)
 
     return stats
+
+#
+# DQN agent
+#
+# we only try to approximate A(s,a) value in policy graident and set policy as
+# pi(a|s) = 1 if a = argmax_a A(s,a)
+#
+class DQNAgent(Agent):
+    def __init__(self, model, dummy_model, device, action_space, eps_start, eps_end, eps_decay):
+        if device:
+            model = model.cuda()
+            dummy_model = dummy_model.cuda()
+
+        self.model = model
+        self.target = dummy_model
+        self.target.load_state_dict(self.model.state_dict())
+        self.device = device
+        self.action_space = action_space
+        self.eps_start = eps_start
+        self.eps_end = eps_end
+        self.eps_decay = eps_decay
+        self.steps_done = 0
+
+    def apply_target(self):
+        self.target.load_state_dict(self.model.state_dict())
+
+    def get_q_value(self, observation) -> torch.Tensor:
+        if self.device:
+            observation = observation.to(self.device)
+        return self.model(observation)
+
+    def get_q_value_target(self, observation) -> torch.Tensor:
+        if self.device:
+            observation = observation.to(self.device)
+        with torch.no_grad():
+            return self.target(observation)
+
+    def get_eps_threshold(self):
+        return self.eps_end + (self.eps_start- self.eps_end) * \
+            math.exp(-1. * self.steps_done / self.eps_decay)
+
+    def get_action(self, observation):
+        sample = np.random.random()
+        eps_threshold = self.get_eps_threshold()
+        self.steps_done += 1
+        if sample > eps_threshold:
+            with torch.no_grad():
+                return self.get_q_value(observation).argmax(dim=1).item()
+        return self.action_space.sample()
+
+@dataclass
+class DQNOptions:
+    optimizer: torch.optim.Optimizer
+    gamma: float = 0.99
+    max_episode_len: int = 1024
+    replay_buf_size: int = 1024
+    update_interval: int = 10000
+    num_envs: int = 4
+    batch_size: int = 64
+    epochs: int = 1000
+    train_count: int = 64
+
+# Assumes determinstic state transition
+def dqn_train(create_env, agent: DQNAgent, options: DQNAgent):
+    env = create_env()
+    stats = RLTrainStats()
+    eb = ReplayEpisodeBuffer(options.replay_buf_size, env.observation_space.shape, (1,))
+    steps = 0
+    for i in range(options.epochs):
+        for k in range(options.num_envs):
+            tot_reward = eb.collect_one(env, agent, options.max_episode_len)
+            if options.report_reward:
+                options.report_reward(tot_reward)
+            stats.reward_history.append(tot_reward)
             
+
+        b_obs, b_next_obs, b_acts, b_rewards, b_dones = eb.sample(options.batch_size)
+        for k in range(options.train_count):
+            steps += options.batch_size
+            qvals = torch.gather(agent.get_q_value(b_obs), dim=1, index=b_acts)
+            y = b_rewards.reshape(-1,1) + (1.0-b_dones)*options.gamma*agent.get_q_value_target(b_next_obs).max(dim=1, keepdim=True)[0]
+            loss = F.smooth_l1_loss(qvals, y)
+
+            options.optimizer.zero_grad()
+            loss.backward()
+            options.optimizer.step()
+
+            if options.report_train:
+                options.report_train({
+                    'loss': loss.item(),
+                    'qval_mean': qvals.mean().item(),
+                    'qval_target_mean': y.mean().item(),
+                    'eps_threshold': agent.get_eps_threshold(),
+                })
+            stats.loss_history.append(loss.item())
+        if steps > options.update_interval:
+            steps = 0
+            agent.apply_target()
+
+    return stats
 
 #
 # PPO agent 
@@ -229,7 +391,7 @@ def ppo_train(create_env, agent: A2CAgent, device, options: PPOOptions):
     stats = RLTrainStats()
 
     for i in range(options.epochs):
-        episode_buffer = EpisodeBuffer(options.num_envs * options.max_episode_len, env.observation_space.shape, (1,),)
+        episode_buffer = RolloutEpisodeBuffer(options.num_envs * options.max_episode_len, env.observation_space.shape, (1,),)
         for k in range(options.num_envs):
             episode_buffer.collect_one(env, agent, options.max_episode_len)
 
