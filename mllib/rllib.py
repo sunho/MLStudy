@@ -258,9 +258,10 @@ class DQNOptions:
     max_episode_len: int = 1024
     replay_buf_size: int = 1024
     update_interval: int = 10000
+    double_dqn: bool = False
     num_envs: int = 4
     batch_size: int = 64
-    epochs: int = 1000
+    train_steps : int = 1000
     train_count: int = 64
 
 # Assumes determinstic state transition
@@ -269,7 +270,8 @@ def dqn_train(create_env, agent: DQNAgent, options: DQNAgent):
     stats = RLTrainStats()
     eb = ReplayEpisodeBuffer(options.replay_buf_size, env.observation_space.shape, (1,))
     steps = 0
-    for i in range(options.epochs):
+    substeps = 0
+    while True:
         for k in range(options.num_envs):
             tot_reward = eb.collect_one(env, agent, options.max_episode_len)
             if options.report_reward:
@@ -279,9 +281,18 @@ def dqn_train(create_env, agent: DQNAgent, options: DQNAgent):
 
         b_obs, b_next_obs, b_acts, b_rewards, b_dones = eb.sample(options.batch_size)
         for k in range(options.train_count):
-            steps += options.batch_size
-            qvals = torch.gather(agent.get_q_value(b_obs), dim=1, index=b_acts)
-            y = b_rewards.reshape(-1,1) + (1.0-b_dones)*options.gamma*agent.get_q_value_target(b_next_obs).max(dim=1, keepdim=True)[0]
+            steps += 1
+            substeps += 1
+            qs = agent.get_q_value(b_obs)
+            qvals = torch.gather(qs, dim=1, index=b_acts)
+            qvals_target = agent.get_q_value_target(b_next_obs)
+            if options.double_dqn:
+                qs2 = agent.get_q_value(b_next_obs)
+                q_acts = qs2.argmax(dim=1).long().reshape(-1,1).detach()
+                qvals_target = torch.gather(qvals_target, dim=1, index=q_acts)
+                y = b_rewards.reshape(-1,1) + (1.0-b_dones)*options.gamma*qvals_target
+            else:
+                y = b_rewards.reshape(-1,1) + (1.0-b_dones)*options.gamma*qvals_target.max(dim=1, keepdim=True)[0]
             loss = F.smooth_l1_loss(qvals, y)
 
             options.optimizer.zero_grad()
@@ -296,9 +307,12 @@ def dqn_train(create_env, agent: DQNAgent, options: DQNAgent):
                     'eps_threshold': agent.get_eps_threshold(),
                 })
             stats.loss_history.append(loss.item())
-        if steps > options.update_interval:
-            steps = 0
+        if substeps > options.update_interval:
+            substeps = 0
             agent.apply_target()
+
+        if steps > options.train_steps:
+            break
 
     return stats
 
