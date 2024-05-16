@@ -46,6 +46,9 @@ class EpisodeBuffer(ABC):
         self.actions = torch.zeros((maxlen, ) + act_shape, dtype=torch.long)
         self.dones = torch.zeros((maxlen, 1))
         self.maxlen = maxlen
+        self.cur_steps = 0
+        self.cur_cum_reward = 0.0
+        self.cur_observation = None
 
     @abstractmethod
     def add_record(self, cur_obs, observation, action, reward, done):
@@ -59,21 +62,38 @@ class EpisodeBuffer(ABC):
     def start_episode(self):
         pass
 
-    def collect_one(self, env: gym.Env, agent: Agent, time_limit: int):
-        observation, info = env.reset()
+    @abstractmethod
+    def get_size(self):
+        pass
 
-        self.start_episode()
-        tot_reward = 0.0
-        for i in range(time_limit):
-            cur_obs = observation
-            action = agent.get_action(cur_obs)
-            observation, reward, terminated, truncated, info = env.step(action)
-            self.add_record(cur_obs, observation, action, reward, terminated)
-            tot_reward += reward
-            if terminated:
-                break
-        self.stop_episode()
-        return tot_reward
+    def step(self, env: gym.Env, agent: Agent, max_steps: int):
+        if self.cur_observation is None:
+            self.cur_observation, info = env.reset()
+            self.start_episode()
+
+        last_obs = self.cur_observation
+        action = agent.get_action(last_obs)
+        self.cur_observation, reward, terminated, truncated, info = env.step(action)
+        self.add_record(last_obs, self.cur_observation, action, reward, terminated)
+        self.cur_cum_reward += reward
+        self.cur_steps += 1
+
+        if self.cur_steps > max_steps or terminated:
+            self.stop_episode()
+            self.cur_steps = 0
+            ret_reward = self.cur_cum_reward
+            self.cur_cum_reward = 0.0
+            self.cur_observation, info = env.reset()
+            self.start_episode()
+            return ret_reward
+        return None
+
+    def collect_one(self, env: gym.Env, agent: Agent, max_steps: int):
+        while True:
+            ret = self.step(env, agent, max_steps)
+            if ret:
+                return ret
+        return None
 
 class RolloutEpisodeBuffer(EpisodeBuffer):
     def __init__(self, maxlen, obs_shape, act_shape):
@@ -88,6 +108,9 @@ class RolloutEpisodeBuffer(EpisodeBuffer):
         self.rewards[self.size] = reward
         self.dones[self.size] = done
         self.size += 1
+
+    def get_size(self):
+        return self.size
 
     def start_episode(self):
         self.start = self.size
@@ -122,6 +145,9 @@ class ReplayEpisodeBuffer(EpisodeBuffer):
         self.size += 1
         self.size = min(self.size, self.maxlen)
 
+    def get_size(self):
+        return self.size
+
     def start_episode(self):
         pass
 
@@ -130,7 +156,7 @@ class ReplayEpisodeBuffer(EpisodeBuffer):
 
     def sample(self, n):
         if self.size <= n:
-            return (self.observations, self.next_observations, self.actions, self.rewards, self.dones)
+            return (self.observations[:n], self.next_observations[:n], self.actions[:n], self.rewards[:n], self.dones[:n])
         else:
             perm = np.random.choice(range(self.size), n, replace=False)
             return (self.observations[perm], self.next_observations[perm], self.actions[perm], self.rewards[perm], self.dones[perm])
@@ -255,65 +281,58 @@ class DQNAgent(Agent):
 class DQNOptions:
     optimizer: torch.optim.Optimizer
     gamma: float = 0.99
+    num_steps : int = 1000
     max_episode_len: int = 1024
     replay_buf_size: int = 1024
-    update_interval: int = 10000
     double_dqn: bool = False
-    num_envs: int = 4
     batch_size: int = 64
-    train_steps : int = 1000
+    train_interval: int = 128
+    update_interval: int = 10000
     train_count: int = 64
 
-# Assumes determinstic state transition
-def dqn_train(create_env, agent: DQNAgent, options: DQNAgent):
+def dqn_train(create_env, agent: DQNAgent, device, options: DQNAgent):
     env = create_env()
     stats = RLTrainStats()
     eb = ReplayEpisodeBuffer(options.replay_buf_size, env.observation_space.shape, (1,))
     steps = 0
-    substeps = 0
-    while True:
-        for k in range(options.num_envs):
-            tot_reward = eb.collect_one(env, agent, options.max_episode_len)
+    for _ in range(options.num_steps):
+        tot_reward = eb.step(env, agent, options.max_episode_len)
+        if tot_reward:
             if options.report_reward:
                 options.report_reward(tot_reward)
             stats.reward_history.append(tot_reward)
-            
+        steps += 1
+        if steps % options.train_interval == 0:
+            if eb.get_size() >= options.batch_size:
+                for k in range(options.train_count):
+                    b_obs, b_next_obs, b_acts, b_rewards, b_dones = eb.sample(options.batch_size)
+                    b_obs, b_next_obs, b_acts, b_rewards, b_dones = b_obs.to(device), b_next_obs.to(device), b_acts.to(device), b_rewards.to(device), b_dones.to(device)
+                    qs = agent.get_q_value(b_obs)
+                    qvals = torch.gather(qs, dim=1, index=b_acts)
+                    qvals_target = agent.get_q_value_target(b_next_obs)
+                    if options.double_dqn:
+                        qs2 = agent.get_q_value(b_next_obs)
+                        q_acts = qs2.argmax(dim=1).long().reshape(-1,1).detach()
+                        qvals_target = torch.gather(qvals_target, dim=1, index=q_acts)
+                        y = b_rewards.reshape(-1,1) + (1.0-b_dones)*options.gamma*qvals_target
+                    else:
+                        y = b_rewards.reshape(-1,1) + (1.0-b_dones)*options.gamma*qvals_target.max(dim=1, keepdim=True)[0]
+                    loss = F.smooth_l1_loss(qvals, y)
 
-        b_obs, b_next_obs, b_acts, b_rewards, b_dones = eb.sample(options.batch_size)
-        for k in range(options.train_count):
-            steps += 1
-            substeps += 1
-            qs = agent.get_q_value(b_obs)
-            qvals = torch.gather(qs, dim=1, index=b_acts)
-            qvals_target = agent.get_q_value_target(b_next_obs)
-            if options.double_dqn:
-                qs2 = agent.get_q_value(b_next_obs)
-                q_acts = qs2.argmax(dim=1).long().reshape(-1,1).detach()
-                qvals_target = torch.gather(qvals_target, dim=1, index=q_acts)
-                y = b_rewards.reshape(-1,1) + (1.0-b_dones)*options.gamma*qvals_target
-            else:
-                y = b_rewards.reshape(-1,1) + (1.0-b_dones)*options.gamma*qvals_target.max(dim=1, keepdim=True)[0]
-            loss = F.smooth_l1_loss(qvals, y)
+                    options.optimizer.zero_grad()
+                    loss.backward()
+                    options.optimizer.step()
 
-            options.optimizer.zero_grad()
-            loss.backward()
-            options.optimizer.step()
-
-            if options.report_train:
-                options.report_train({
-                    'loss': loss.item(),
-                    'qval_mean': qvals.mean().item(),
-                    'qval_target_mean': y.mean().item(),
-                    'eps_threshold': agent.get_eps_threshold(),
-                })
-            stats.loss_history.append(loss.item())
-        if substeps > options.update_interval:
-            substeps = 0
+                    if options.report_train:
+                        options.report_train({
+                            'loss': loss.item(),
+                            'qval_mean': qvals.mean().item(),
+                            'qval_target_mean': y.mean().item(),
+                            'eps_threshold': agent.get_eps_threshold(),
+                        })
+                    stats.loss_history.append(loss.item())
+        if steps % options.update_interval == 0: 
             agent.apply_target()
-
-        if steps > options.train_steps:
-            break
-
     return stats
 
 #
